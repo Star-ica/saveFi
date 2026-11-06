@@ -38,120 +38,340 @@ label{display:block;font-weight:600;margin:10px 0 3px;font-size:13px}input,selec
 <header><a class="logo" href="#/">◎ SaveFi</a><nav id="nav"></nav><div id="wallet" class="row"></div></header>
 <main id="app"></main><div id="toast"></div>
 <script>
+/* ───────── Config: BOT Chain Testnet ───────── */
+const CFG={
+  factory:"0x489f48Cf8b1931BB86C1010CF6B878641aD8F2FB",
+  usdt:"0x75edC9335175Fc0552D51D48439F229c10420fe3",
+  chainId:968,chainHex:"0x3c8",chainName:"BOT Chain Testnet",
+  rpc:"https://rpc.bohr.life",explorer:"https://scan.bohr.life"
+};
+const ZERO=ethers.constants.AddressZero;
 const DAY=86400,FREQ={Daily:DAY,Weekly:7*DAY,"Bi-weekly":14*DAY,Monthly:30*DAY};
-const S={me:null,clock:0,live:false,cs:[],cfg:{factory:"",usdt:"",bot:""}};
-const now=()=>Math.floor(Date.now()/1000)+S.clock,req=(c,m)=>{if(!c)throw new Error(m)};
-const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const STATES=["Open","Active","Completed","Cancelled"];
+const S={me:null,signer:null,cs:[],pots:[],tokens:[],factoryOwner:null};
+
+const FABI=[
+ "function createCircle(tuple(string name,address token,uint256 amount,uint32 period,uint32 grace,uint16 rounds,uint16 lateFeeBps,uint16 earlyExitPenaltyBps,uint8 maxMembers,bool inviteOnly,uint256 goalTarget) p) returns (address)",
+ "function createPot(string name,address token,uint256 target,uint256 unlockTime,uint256 minContribution) returns (address)",
+ "function allCircles() view returns (address[])",
+ "function allPots() view returns (address[])",
+ "function circlesOf(address) view returns (address[])",
+ "function owner() view returns (address)",
+ "function minPeriod() view returns (uint32)",
+ "function tokenAllowed(address) view returns (bool)",
+ "function setTokenAllowed(address,bool)",
+ "event CircleCreated(address indexed circle,address indexed creator)",
+ "event PotCreated(address indexed pot,address indexed beneficiary)"
+];
+const CABI=[
+ "function p() view returns (string name,address token,uint256 amount,uint32 period,uint32 grace,uint16 rounds,uint16 lateFeeBps,uint16 earlyExitPenaltyBps,uint8 maxMembers,bool inviteOnly,uint256 goalTarget)",
+ "function admin() view returns (address)",
+ "function state() view returns (uint8)",
+ "function paused() view returns (bool)",
+ "function startTime() view returns (uint256)",
+ "function totalContributed() view returns (uint256)",
+ "function unlocked() view returns (bool)",
+ "function getMembers() view returns (address[])",
+ "function invited(address) view returns (bool)",
+ "function paid(uint256,address) view returns (bool)",
+ "function mem(address) view returns (bool active,uint256 contributed,uint256 bal,uint16 late,bool refunded)",
+ "function invite(address[])",
+ "function join()",
+ "function leave()",
+ "function contribute(uint256) payable",
+ "function withdraw()",
+ "function cancel()",
+ "function refund()",
+ "function setPaused(bool)"
+];
+const PABI=[
+ "function beneficiary() view returns (address)",
+ "function token() view returns (address)",
+ "function name() view returns (string)",
+ "function target() view returns (uint256)",
+ "function unlockTime() view returns (uint256)",
+ "function minContribution() view returns (uint256)",
+ "function total() view returns (uint256)",
+ "function withdrawn() view returns (uint256)",
+ "function cancelled() view returns (bool)",
+ "function paused() view returns (bool)",
+ "function unlocked() view returns (bool)",
+ "function contributed(address) view returns (uint256)",
+ "function contributors() view returns (address[])",
+ "function contribute(uint256) payable",
+ "function withdraw(uint256)",
+ "function cancel()",
+ "function refund()"
+];
+const EABI=["function approve(address,uint256) returns (bool)","function allowance(address,address) view returns (uint256)","function balanceOf(address) view returns (uint256)","function decimals() view returns (uint8)","function symbol() view returns (string)"];
+
+const readProvider=new ethers.providers.StaticJsonRpcProvider(CFG.rpc,{chainId:CFG.chainId,name:"botchain-testnet"});
+const runner=()=>S.signer||readProvider;
+const factory=()=>new ethers.Contract(CFG.factory,FABI,runner());
+const circleC=a=>new ethers.Contract(a,CABI,runner());
+const potC=a=>new ethers.Contract(a,PABI,runner());
+
+/* ───────── Helpers ───────── */
+const now=()=>Math.floor(Date.now()/1000);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const sh=a=>a?a.slice(0,6)+"…"+a.slice(-4):"—",$=s=>document.querySelector(s);
 const fd=t=>new Date(t*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"});
 const fname=p=>Object.keys(FREQ).find(k=>FREQ[k]===p)||Math.round(p/DAY)+"-day";
-const mkAddr=i=>{let h="",x=i*7919+13;while(h.length<40){x=(Math.imul(x,1103515245)+12345)>>>0;h+=x.toString(16).padStart(8,"0")}return"0x"+h.slice(0,40)};
 const av=a=>{const h=parseInt(a.slice(2,6),16)%360;return`<span class="av" title="${a}" style="background:linear-gradient(135deg,hsl(${h} 65% 52%),hsl(${(h+50)%360} 70% 40%))">${a.slice(2,4).toUpperCase()}</span>`};
-const cur=c=>c.state!=="Active"?0:Math.min(Math.floor((now()-c.start)/c.period),c.rounds-1);
+const num=(v,d)=>Number(ethers.utils.formatUnits(v,d));
+const fn=x=>Number(x).toLocaleString(undefined,{maximumFractionDigits:4});
+const same=(a,b)=>!!a&&!!b&&a.toLowerCase()===b.toLowerCase();
+const cur=c=>c.state!=="Active"?0:Math.max(0,Math.min(Math.floor((now()-c.start)/c.period),c.rounds-1));
 const dl=(c,r)=>c.start+(r+1)*c.period;
-const cellState=(c,a,r)=>{const m=c.mem[a];if(m.paid[r])return"ok";if(c.state!=="Active"||r>cur(c))return"fut";return now()>dl(c,r)+c.grace?"miss":"due"};
-const owed=(c,a)=>c.state==="Active"?Array.from({length:cur(c)+1},(_,r)=>r).filter(r=>!c.mem[a].paid[r]).length:0;
-function progress(c){if(c.state==="Open")return Math.round(100*c.members.length/c.max);
- if(c.mode==="Goal")return Math.min(100,Math.round(100*c.total/c.goal));
- let n=0;c.members.forEach(a=>{for(let r=0;r<c.rounds;r++)if(c.mem[a].paid[r])n++});return Math.round(100*n/(c.max*c.rounds))}
-/* ───────── Demo chain: mirrors the Solidity rules in JS ───────── */
-const D={cs:[],pots:[],f(id){return this.cs.find(c=>c.id===id)},pf(id){return this.pots.find(c=>c.id===id)},
-createPot(p){const c={...p,id:mkAddr(200+this.pots.length),owner:S.me,state:"Active",contribs:{},total:0,withdrawn:0};this.pots.push(c);return c.id},
-potContribute(id,a){const c=this.pf(id);req(c.state==="Active","Pot is closed");req(a>0&&a>=c.min,"Below the minimum contribution ("+c.min+")");c.contribs[S.me]=(c.contribs[S.me]||0)+a;c.total+=a},
-potWithdraw(id){const c=this.pf(id);req(S.me===c.owner,"Only the pot owner can withdraw");req(c.state==="Active","Pot is closed");req(c.total>=c.target||now()>=c.unlock,"Locked until the target is reached or the unlock date passes");req(c.total-c.withdrawn>0,"Nothing left to withdraw");c.withdrawn=c.total},
-potCancel(id){const c=this.pf(id);req(S.me===c.owner,"Only the pot owner");req(c.state==="Active"&&c.total<c.target&&now()<c.unlock&&c.withdrawn===0,"Cannot cancel now");c.state="Cancelled"},
-potRefund(id){const c=this.pf(id),a=c.contribs[S.me]||0;req(c.state==="Cancelled"&&a>0,"Nothing to refund");c.contribs[S.me]=0},
-create(p){const c={...p,id:mkAddr(100+this.cs.length),admin:S.me,state:"Open",start:0,members:[],mem:{},nextPayout:0,payouts:[],pool:0,total:0,paused:false,claim:{},rp:{},settled:{},invited:{}};this.cs.push(c);return c.id},
-join(id){const c=this.f(id);req(c.state==="Open"&&!c.paused,"Circle is not open");req(!c.mem[S.me],"Already a member");req(c.members.length<c.max,"Circle is full");req(!c.inviteOnly||c.invited[S.me]||S.me===c.admin,"Invite only");
- c.members.push(S.me);c.mem[S.me]={paid:{},deposit:c.amount*c.depositRounds,used:0,received:0,missed:0,late:0,bal:0,active:true};
- if(c.members.length===c.max){c.state="Active";c.start=now()}},
-contribute(id,r){const c=this.f(id),m=c.mem[S.me];req(c.state==="Active"&&!c.paused,"Circle not active");req(m&&m.active,"Not a member");req(r<=cur(c),"Round not open yet");req(!m.paid[r],"Already contributed this round");
- let fee=0;if(now()>dl(c,r)){fee=c.amount*c.lateFeeBps/1e4;m.late++}
- m.paid[r]=true;c.total+=c.amount;c.pool+=c.amount+fee;
- if(c.mode==="Goal")m.bal+=c.amount;else if(c.settled[r]){const rc=c.members[r];c.claim[rc]=(c.claim[rc]||0)+c.amount+fee;c.mem[rc].received+=c.amount+fee}else c.rp[r]=(c.rp[r]||0)+c.amount+fee},
-leave(id){const c=this.f(id),m=c.mem[S.me];req(m&&m.active,"Not a member");
- if(c.state==="Open"){c.members=c.members.filter(a=>a!==S.me);delete c.mem[S.me]}
- else if(c.state==="Active"&&c.mode==="Goal"){const early=now()<c.start+c.rounds*c.period&&c.total<c.goal;const pen=early?m.bal*c.penalty/1e4:0;c.pool-=m.bal-pen;m.bal=0;m.active=false}
- else throw new Error("Rotating circles are committed once started")},
-pause(id){const c=this.f(id);req(S.me===c.admin,"Admin only");c.paused=!c.paused},
-cancel(id){const c=this.f(id);req(S.me===c.admin,"Admin only");req(c.state==="Open"||c.paused,"Pause an active circle first");c.state="Cancelled"},
-invite(id,a){const c=this.f(id);req(S.me===c.admin,"Admin only");c.invited[a]=true}};
-function seed(){const A=Array.from({length:8},(_,i)=>mkAddr(i+1));S.ids=A;const as=(a,f)=>{S.me=a;return f()};
- S.clock=-10*DAY;const a=as(A[0],()=>D.create({name:"Ajo Builders Circle",mode:"Goal",token:"USDT",amount:50,period:7*DAY,grace:DAY,rounds:8,lateFeeBps:500,depositRounds:0,max:5,goal:2000,penalty:1000,inviteOnly:false}));
- A.slice(0,5).forEach(x=>as(x,()=>D.join(a)));A.slice(0,4).forEach(x=>as(x,()=>D.contribute(a,0)));
- S.clock=0;A.slice(0,3).forEach(x=>as(x,()=>D.contribute(a,1)));
- S.clock=-35*DAY;const g=as(A[2],()=>D.create({name:"Rent & Emergency Vault",mode:"Goal",token:"BOT",amount:100,period:30*DAY,grace:3*DAY,rounds:6,lateFeeBps:300,depositRounds:0,max:4,goal:2000,penalty:1000,inviteOnly:false}));
- A.slice(2,6).forEach(x=>as(x,()=>D.join(g)));A.slice(2,6).forEach(x=>as(x,()=>D.contribute(g,0)));S.clock=0;A.slice(2,5).forEach(x=>as(x,()=>D.contribute(g,1)));
- const o=as(A[6],()=>D.create({name:"Campus Cohort Savings",mode:"Goal",token:"BOT",amount:20,period:7*DAY,grace:DAY,rounds:6,lateFeeBps:500,depositRounds:0,max:6,goal:600,penalty:500,inviteOnly:false}));
- [5,6,7].forEach(i=>as(A[i],()=>D.join(o)));S.me=A[1];const pt=D.createPot({name:"Ada’s Laptop Fund",token:"USDT",target:800,unlock:now()+30*DAY,min:5});[[A[0],100],[A[3],50],[A[1],120]].forEach(([x,n])=>{S.me=x;D.potContribute(pt,n)});S.me=A[1]}
-/* ───────── Live chain (ethers v5) ───────── */
-const FABI=["function createCircle((string name,address token,uint256 amount,uint32 period,uint32 grace,uint16 rounds,uint16 lateFeeBps,uint16 earlyExitPenaltyBps,uint8 maxMembers,bool inviteOnly,uint256 goalTarget)) returns (address)","function allCircles() view returns (address[])","function owner() view returns (address)"];
-const CABI=["function p() view returns (string name,address token,uint256 amount,uint32 period,uint32 grace,uint16 rounds,uint16 lateFeeBps,uint16 earlyExitPenaltyBps,uint8 maxMembers,bool inviteOnly,uint256 goalTarget)","function admin() view returns (address)","function state() view returns (uint8)","function startTime() view returns (uint256)","function nextPayout() view returns (uint16)","function pool() view returns (uint256)","function totalContributed() view returns (uint256)","function paused() view returns (bool)","function getMembers() view returns (address[])","function paid(uint256,address) view returns (bool)","function mem(address) view returns (bool active,uint256 deposit,uint256 used,uint256 contributed,uint256 received,uint256 bal,uint16 missed,uint16 late,bool refunded)","function join(id){const c=S.cs.find(x=>x.id===id);if(!c)return"<p>Circle not found.</p>";const link=location.origin+location.pathname+"#/join/"+id,m=c.mem[S.me];
- return`<h1>Join “${esc(c.name)}”</h1><div class="card"><div class="stats"><div><b>${c.amount} ${c.token}</b>per ${fname(c.period).toLowerCase()} round</div><div><b>${c.members.length}/${c.max}</b>members</div><div><b>${c.goal} ${c.token}</b>shared goal</div><div><b>${c.lateFeeBps/100}%</b>late fee</div></div>
-<p>Contributions go to a shared vault. You can withdraw your savings once the goal is reached or the term ends (${c.rounds} rounds); leaving earlier forfeits ${c.penalty/100}%, shared with the members who stay. A payment after its deadline pays the late fee.</p>
-<p class="mut">Joining wallet: <b>${sh(S.me)}</b></p>${m?'<p class="pill">You are already a member</p>':`<button class="btn" data-a="join" data-id="${id}" ${c.state!=="Open"?"disabled":""}>Join with my wallet</button>`}<h3 style="margin-top:16px">Invite link</h3><div class="copy">${link}</div></div>`}
-/* ───────── Actions ───────── */
-const toast=m=>{const t=$("#toast");t.textContent=m;t.style.display="block";clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display="none",3500)};
-async function act(name,id,arg){try{if(S.live){req(!/^pot|Pot$/.test(name),"Personal pots are demo-only in the UI for now; the SavingsPot contract is ready to call directly");await liveAct(name,id,arg)}else{const r=D[name](...((name==="create"||name==="createPot")?[arg]:arg===undefined?[id]:[id,arg]));if(name==="claim")toast("Claimed "+r+" to your wallet")}
- S.cs=await load();if(name==="create"){location.hash="#/discover";return}if(name==="createPot"){location.hash="#/pot/"+D.pots[D.pots.length-1].id;return}toast(({join:"Joined circle",contribute:"Contribution recorded",payout:"Payout scheduled — recipient can now claim",claim:"Claimed",leave:"You left the circle",pause:"Pause toggled",cancel:"Circle cancelled — members can refund",invite:"Wallet invited",potContribute:"Thank you — added to the pot",potWithdraw:"Withdrawn to your wallet",potCancel:"Pot cancelled — contributors can refund",potRefund:"Refund sent",createPot:"Pot created"})[name]||"Done");render()}catch(e){toast(e.reason||e.data?.message||e.message)}}
-const load=async()=>S.live?liveLoad():D.cs;
+const lastRound=c=>c.start?Math.min(c.rounds-1,Math.floor((now()-c.start)/c.period)):-1;
+const errMsg=e=>e?.code===4001||e?.code==="ACTION_REJECTED"?"Transaction rejected":(e?.reason||e?.error?.message||e?.data?.message||e?.message||"Something went wrong").replace(/^execution reverted:\s*/i,"");
+// Contract has no grace logic: after a round's deadline you can still pay (until term end) but the late fee applies
+const cellState=(c,a,r)=>{const m=c.mem[a];if(m&&m.paid[r])return"ok";if(c.state!=="Active"||r>cur(c))return"fut";return now()>dl(c,r)?"miss":"due"};
+const owed=(c,a)=>c.state==="Active"&&c.mem[a]?.active?Array.from({length:cur(c)+1},(_,r)=>r).filter(r=>!c.mem[a].paid[r]).length:0;
+function progress(c){if(c.state==="Open")return Math.round(100*c.members.length/c.max);return Math.min(100,Math.round(100*c.total/(c.goal||1)))}
+
+const tokenCache={};
+async function tokenMeta(addr){
+  if(addr===ZERO)return{symbol:"BOT",decimals:18};
+  const k=addr.toLowerCase();if(tokenCache[k])return tokenCache[k];
+  const t=new ethers.Contract(addr,EABI,readProvider);let symbol="TOKEN",decimals=18;
+  try{symbol=await t.symbol()}catch{}try{decimals=await t.decimals()}catch{}
+  return tokenCache[k]={symbol,decimals:Number(decimals)};
+}
+
+/* ───────── Chain reads ───────── */
+async function fetchCircle(addr,full=false){
+  const c=circleC(addr);
+  const [p,admin,st,paused,start,total,members,unlocked]=await Promise.all([c.p(),c.admin(),c.state(),c.paused(),c.startTime(),c.totalContributed(),c.getMembers(),c.unlocked()]);
+  const t=await tokenMeta(p.token);
+  const o={id:addr,name:p.name,tokenAddr:p.token,token:t.symbol,dec:t.decimals,amountRaw:p.amount,amount:num(p.amount,t.decimals),period:Number(p.period),rounds:Number(p.rounds),lateFeeBps:Number(p.lateFeeBps),penalty:Number(p.earlyExitPenaltyBps),max:Number(p.maxMembers),inviteOnly:p.inviteOnly,goalRaw:p.goalTarget,goal:num(p.goalTarget,t.decimals),admin,state:STATES[st]||"Unknown",paused,start:Number(start),totalRaw:total,total:num(total,t.decimals),members:[...members],mem:{},unlocked};
+  const who=full?o.members:(S.me&&o.members.some(a=>same(a,S.me))?[o.members.find(a=>same(a,S.me))]:[]);
+  await Promise.all(who.map(async a=>{const m=await c.mem(a);o.mem[a]={active:m.active,contributed:num(m.contributed,t.decimals),bal:num(m.bal,t.decimals),balRaw:m.bal,late:Number(m.late),refunded:m.refunded,paid:{}}}));
+  if(full)await loadPaid(o,o.members);
+  return o;
+}
+async function loadPaid(o,addrs){
+  const last=lastRound(o);if(last<0)return;const c=circleC(o.id);
+  await Promise.all(addrs.filter(a=>o.mem[a]).map(async a=>{
+    const res=await Promise.all(Array.from({length:last+1},(_,r)=>c.paid(r,a)));
+    res.forEach((v,r)=>{if(v)o.mem[a].paid[r]=true});
+  }));
+}
+async function fetchPot(addr,full=false){
+  const c=potC(addr);
+  const [b,t,name,target,unlock,min,total,wd,canc,paused,contribs,unl]=await Promise.all([c.beneficiary(),c.token(),c.name(),c.target(),c.unlockTime(),c.minContribution(),c.total(),c.withdrawn(),c.cancelled(),c.paused(),c.contributors(),c.unlocked()]);
+  const tm=await tokenMeta(t);
+  const o={id:addr,owner:b,tokenAddr:t,token:tm.symbol,dec:tm.decimals,name,targetRaw:target,target:num(target,tm.decimals),unlock:Number(unlock),minRaw:min,min:num(min,tm.decimals),totalRaw:total,total:num(total,tm.decimals),withdrawnRaw:wd,withdrawn:num(wd,tm.decimals),state:canc?"Cancelled":"Active",paused,contributors:[...contribs],contribs:{},unlocked:unl};
+  if(full){const amts=await Promise.all(o.contributors.map(a=>c.contributed(a)));o.contributors.forEach((a,i)=>o.contribs[a]=num(amts[i],tm.decimals))}
+  else o.contributors.forEach(a=>o.contribs[a]=0);
+  return o;
+}
+async function loadTokens(){
+  const f=factory();
+  const [owner,botOk,usdtOk]=await Promise.all([f.owner(),f.tokenAllowed(ZERO),f.tokenAllowed(CFG.usdt)]);
+  const usdt=await tokenMeta(CFG.usdt);
+  S.factoryOwner=owner;
+  S.tokens=[{addr:ZERO,symbol:"BOT",decimals:18,allowed:botOk},{addr:CFG.usdt,symbol:usdt.symbol,decimals:usdt.decimals,allowed:usdtOk}];
+}
+async function loadAll(){
+  const f=factory();
+  const [cs,ps]=await Promise.all([f.allCircles(),f.allPots()]);
+  [S.cs,S.pots]=await Promise.all([Promise.all([...cs].reverse().map(a=>fetchCircle(a))),Promise.all([...ps].reverse().map(a=>fetchPot(a)))]);
+}
+const mine=()=>S.cs.filter(c=>S.me&&c.members.some(a=>same(a,S.me)));
+const meIn=c=>S.me?c.members.find(a=>same(a,S.me)):null;
+
+/* ───────── Wallet ───────── */
+async function ensureChain(){
+  const curC=await window.ethereum.request({method:"eth_chainId"});
+  if(parseInt(curC,16)===CFG.chainId)return;
+  try{await window.ethereum.request({method:"wallet_switchEthereumChain",params:[{chainId:CFG.chainHex}]})}
+  catch(e){const code=e?.code??e?.data?.originalError?.code;
+    if(code===4902||/unrecognized|not added|unknown chain/i.test(e?.message||""))await window.ethereum.request({method:"wallet_addEthereumChain",params:[{chainId:CFG.chainHex,chainName:CFG.chainName,nativeCurrency:{name:"BOT",symbol:"BOT",decimals:18},rpcUrls:[CFG.rpc],blockExplorerUrls:[CFG.explorer]}]});
+    else throw e}
+}
+async function connect(){
+  if(!window.ethereum)throw new Error("No wallet found. Install a browser wallet that supports BOT Chain.");
+  await window.ethereum.request({method:"eth_requestAccounts"});
+  await ensureChain();
+  // create the provider after switching chain
+  const prov=new ethers.providers.Web3Provider(window.ethereum);
+  S.signer=prov.getSigner();S.me=await S.signer.getAddress();
+  await loadAll();
+}
+
+/* ───────── Transactions ───────── */
+const toast=m=>{const t=$("#toast");t.textContent=m;t.style.display="block";clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display="none",4000)};
+async function send(fn,ok){toast("Confirm in your wallet…");const tx=await fn();toast("Transaction sent — waiting for confirmation…");const r=await tx.wait();toast(ok);return r}
+async function ensureFunds(token,amount){
+  if(token===ZERO){const b=await S.signer.getBalance();if(b.lt(amount))throw new Error("Insufficient BOT balance");return}
+  const t=new ethers.Contract(token,EABI,S.signer);
+  if((await t.balanceOf(S.me)).lt(amount))throw new Error("Insufficient token balance");
+}
+async function ensureAllowance(token,spender,amount){
+  if(token===ZERO)return;
+  const t=new ethers.Contract(token,EABI,S.signer);
+  const curA=await t.allowance(S.me,spender);if(curA.gte(amount))return;
+  // USDT-style tokens need a non-zero allowance reset to 0 first
+  if(!curA.isZero())await send(()=>t.approve(spender,0),"Allowance reset");
+  await send(()=>t.approve(spender,amount),"Token approved");
+}
+
+const ACTIONS={
+  async join(id){await send(()=>circleC(id).join(),"Joined circle")},
+  async contribute(id,r){
+    const c=await fetchCircle(id);const late=now()>dl(c,r);
+    const maxFee=c.amountRaw.mul(c.lateFeeBps).div(10000);const fee=late?maxFee:ethers.constants.Zero;const total=c.amountRaw.add(fee);
+    if(late&&!confirm(`Round ${r+1} is past its deadline, so a ${c.lateFeeBps/100}% late fee (${fn(num(fee,c.dec))} ${c.token}) applies. Continue?`))return;
+    await ensureFunds(c.tokenAddr,total);
+    if(c.tokenAddr===ZERO)await send(()=>circleC(id).contribute(r,{value:total}),"Contribution recorded");
+    else{await ensureAllowance(c.tokenAddr,id,c.amountRaw.add(maxFee));await send(()=>circleC(id).contribute(r),"Contribution recorded")}
+  },
+  async withdraw(id){await send(()=>circleC(id).withdraw(),"Savings withdrawn to your wallet")},
+  async leave(id){
+    const c=await fetchCircle(id);const m=c.mem[meIn(c)];
+    if(c.state==="Active"&&!c.unlocked&&!confirm(`Exiting early forfeits ${c.penalty/100}% of your ${fn(m?.bal||0)} ${c.token} balance (shared with members who stay), and you can't rejoin. Continue?`))return;
+    await send(()=>circleC(id).leave(),c.state==="Open"?"You left the circle":"Exited — funds sent to your wallet");
+  },
+  async refund(id){await send(()=>circleC(id).refund(),"Refund sent")},
+  async pause(id){const p=await circleC(id).paused();await send(()=>circleC(id).setPaused(!p),p?"Circle resumed":"Circle paused")},
+  async cancel(id){if(!confirm("Cancel this circle? Members will be able to refund their balances. This cannot be undone."))return;await send(()=>circleC(id).cancel(),"Circle cancelled — members can refund")},
+  async invite(id,a){if(!ethers.utils.isAddress(a))throw new Error("Enter a valid wallet address");await send(()=>circleC(id).invite([a]),"Wallet invited")},
+  async create(_,p){
+    const r=await send(()=>factory().createCircle(p),"Circle created");
+    const ev=r.events?.find(e=>e.event==="CircleCreated");return ev?"#/circle/"+ev.args.circle:"#/discover";
+  },
+  async createPot(_,p){
+    const r=await send(()=>factory().createPot(p.name,p.token,p.target,p.unlock,p.min),"Pot created");
+    const ev=r.events?.find(e=>e.event==="PotCreated");return ev?"#/pot/"+ev.args.pot:"#/discover";
+  },
+  async potContribute(id,amtStr){
+    const c=await fetchPot(id);let amt;
+    try{amt=ethers.utils.parseUnits(String(amtStr||"0"),c.dec)}catch{throw new Error("Enter a valid amount")}
+    if(amt.isZero()||amt.lt(c.minRaw))throw new Error(`Minimum contribution is ${fn(c.min)} ${c.token}`);
+    await ensureFunds(c.tokenAddr,amt);
+    if(c.tokenAddr===ZERO)await send(()=>potC(id).contribute(amt,{value:amt}),"Thank you — added to the pot");
+    else{await ensureAllowance(c.tokenAddr,id,amt);await send(()=>potC(id).contribute(amt),"Thank you — added to the pot")}
+  },
+  async potWithdraw(id){const c=await fetchPot(id);const avail=c.totalRaw.sub(c.withdrawnRaw);if(avail.isZero())throw new Error("Nothing left to withdraw");await send(()=>potC(id).withdraw(avail),"Withdrawn to your wallet")},
+  async potCancel(id){if(!confirm("Cancel this pot? Every contributor (you included) can then refund their own contribution."))return;await send(()=>potC(id).cancel(),"Pot cancelled — contributors can refund")},
+  async potRefund(id){await send(()=>potC(id).refund(),"Refund sent")},
+  async allowToken(_,addr){await send(()=>factory().setTokenAllowed(addr,true),"Token allowed");await loadTokens()}
+};
+async function act(name,id,arg){
+  try{
+    if(!S.me){await connect();if(!S.me)return}
+    const next=await ACTIONS[name](id,arg);
+    await loadAll();
+    if(next&&next!==location.hash)location.hash=next;else render();
+  }catch(e){console.error(e);toast(errMsg(e))}
+}
+
 /* ───────── Views ───────── */
-const card=c=>{const p=progress(c);return`<a class="card" href="#/circle/${c.id}"><div class="row"><b>${esc(c.name)}</b><span class="pill ${c.mode==="Goal"?"gold":""}">${c.mode}</span></div><div class="mut">${c.amount} ${c.token} · ${fname(c.period)} · ${c.members.length}/${c.max} members</div><div class="bar"><i style="width:${p}%"></i></div><div class="row mut"><span>${c.state}${c.paused?" · paused":""}</span><span>${p}% ${c.state==="Open"?"filled":"saved"}</span></div><div class="avs">${c.members.slice(0,7).map(av).join("")}</div></a>`};
-const mine=()=>S.cs.filter(c=>c.mem[S.me]);
-function landing(){const tot=S.cs.reduce((s,c)=>s+c.total,0)+D.pots.reduce((s,c)=>s+c.total,0);return`<div class="hero"><h1>Save together. Reach the goal.</h1><p style="max-width:560px">SaveFi brings cooperative saving on-chain: group goal circles with fixed contributions, or a personal pot that friends and family can add to. Rules are enforced by smart contracts — not promises.</p><a class="btn" href="#/create">Create a circle</a> <a class="btn alt" href="#/newpot">Start a personal pot</a> <a class="btn alt" href="#/discover">Browse</a></div>
-<div class="stats"><div><b>${S.cs.length}</b>circles</div><div><b>${D.pots.length}</b>personal pots</div><div><b>${tot}</b>contributed (mixed units)</div></div>
-<h2>Ways to save</h2><div class="grid"><div class="card"><h3>🎯 Goal circle</h3><p class="mut">A group pools toward a shared target on a schedule. Withdraw once the target is met or the term ends; leaving early costs a penalty shared with those who stay.</p></div><div class="card"><h3>🐷 Personal pot</h3><p class="mut">Saving for one goal? Share your link and others add to your pot. You withdraw when the target or date is reached.</p></div><div class="card"><h3>🛡 Honest by design</h3><p class="mut">Nothing runs by itself — every withdrawal is a transaction you send. Admins can never touch member funds.</p></div></div>`}
-function discover(q={}){const t=(q.s||"").toLowerCase(),list=S.cs.filter(c=>(!q.t||c.token===q.t)&&c.name.toLowerCase().includes(t));
- return`<h1>Discover</h1><div class="f2"><div><input id="fs" placeholder="Search by name" value="${esc(q.s||"")}"></div><div><select id="ft"><option value="">BOT &amp; USDT</option><option ${q.t==="BOT"?"selected":""}>BOT</option><option ${q.t==="USDT"?"selected":""}>USDT</option></select></div></div><h2>Goal circles</h2><div class="grid">${list.map(card).join("")||'<p class="mut">No circles match.</p>'}</div><h2>Personal savings pots</h2><div class="grid">${D.pots.filter(c=>(!q.t||c.token===q.t)&&c.name.toLowerCase().includes(t)).map(potCard).join("")}</div>`}
-function create(){return`<h1>Create a savings circle</h1><p><a href="#/newpot"><u>Saving for yourself? Create a personal pot others can add to →</u></a></p><form id="cf" class="card"><div class="f2"><div><label>Circle name</label><input name="name" required maxlength="64" value="Neighbours Savings"></div><div><label>Currency</label><select name="token"><option>USDT</option><option>BOT</option></select></div>
-<div><label>Contribution per member per round</label><input name="amount" type="number" min="0.01" step="any" value="50" required></div><div><label>Frequency</label><select name="freq">${Object.keys(FREQ).map(k=>`<option ${k==="Weekly"?"selected":""}>${k}</option>`).join("")}</select></div>
-<div><label>Number of members (2–50)</label><input name="max" type="number" min="2" max="50" value="5" required></div><div><label>Duration in rounds</label><input name="rounds" type="number" min="1" max="520" value="8"></div>
-<div><label>Shared goal target</label><input name="goal" type="number" min="1" step="any" value="1500"></div><div><label>Grace period (days after deadline)</label><input name="grace" type="number" min="0" value="1"></div>
-<div><label>Late fee (%)</label><input name="late" type="number" min="0" max="20" step="0.5" value="5"></div><div><label>Early-exit penalty (%)</label><input name="pen" type="number" min="0" max="50" value="10"></div></div>
-<label><input type="checkbox" name="inv" style="width:auto"> Invite only</label><div id="prev" class="mut" style="margin:12px 0"></div><button class="btn">Create circle</button> <span class="mut">${S.live?"Sends a transaction to the factory.":"Demo mode — nothing leaves your browser."}</span></form>`}
-function join(id){const c=S.cs.find(x=>x.id===id);if(!c)return"<p>Circle not found.</p>";const link=location.origin+location.pathname+"#/join/"+id,m=c.mem[S.me];
- return`<h1>Join “${esc(c.name)}”</h1><div class="card"><div class="stats"><div><b>${c.amount} ${c.token}</b>per ${fname(c.period).toLowerCase()} round</div><div><b>${c.members.length}/${c.max}</b>members</div><div><b>${c.amount*c.depositRounds} ${c.token}</b>refundable deposit</div><div><b>${c.lateFeeBps/100}%</b>late fee</div></div>
-<p>${c.mode==="Rotating"?"You will receive one pot of "+c.amount*c.max+" "+c.token+" in your payout round, order fixed by join order. Missing a payment (after "+Math.round(c.grace/DAY)+" grace day(s)) is covered from your deposit — if the deposit runs out, the pot is short.":"Contributions go to a shared vault with a target of "+c.goal+" "+c.token+". You may withdraw once the target is reached or the term ends; leaving earlier forfeits "+c.penalty/100+"%."}</p>
-<p class="mut">Joining wallet: <b>${sh(S.me)}</b></p>${m?'<p class="pill">You are already a member</p>':`<button class="btn" data-a="join" data-id="${id}" ${c.state!=="Open"?"disabled":""}>Join with my wallet</button>`}<h3 style="margin-top:16px">Invite link</h3><div class="copy">${link}</div></div>`}
-function circle(id){const c=S.cs.find(x=>x.id===id);if(!c)return"<p>Circle not found.</p>";const m=c.mem[S.me],cr=cur(c),p=progress(c),act=c.state==="Active"&&!c.paused,end=c.start+c.rounds*c.period,open=c.state==="Active"&&(c.total>=c.goal||now()>=end);
- const due=m&&act?Array.from({length:cr+1},(_,r)=>r).filter(r=>!m.paid[r]):[];
- const stats=`<div class="card"><div class="row"><h1>${esc(c.name)}</h1><span><span class="pill gold">Goal circle</span> <span class="pill ${c.paused||c.state==="Cancelled"?"bad":""}">${c.state}${c.paused?" · paused":""}</span></span></div><div class="mut">Admin ${sh(c.admin)} · ${c.token}</div><div class="bar"><i style="width:${p}%"></i></div><div class="stats"><div><b>${c.state==="Open"?c.members.length+"/"+c.max:c.total+" / "+c.goal}</b>${c.state==="Open"?"members joined":c.token+" saved"}</div><div><b>${open?"Unlocked":"Locked"}</b>${open?"withdrawals open":"until goal or "+(c.state==="Active"?fd(end):"term end")}</div><div><b>${c.state==="Active"?"Round "+(cr+1)+"/"+c.rounds:c.state}</b>${c.state==="Active"?"due "+fd(dl(c,cr)):"schedule starts when full"}</div><div><b>${m?m.bal:"—"}</b>your balance</div></div><div class="avs">${c.members.map(av).join("")}</div></div>`;
- const acts=`<div class="card"><h3>Your actions</h3>${!m?`<a class="btn" href="#/join/${id}">Join this circle</a>`:`<div class="row" style="justify-content:flex-start">${due.map(r=>`<button class="btn" data-a="contribute" data-id="${id}" data-r="${r}">Contribute round ${r+1}${now()>dl(c,r)?" (late fee)":""}</button>`).join("")}<button class="btn ${open?"alt":"bad"}" data-a="leave" data-id="${id}" ${c.state==="Completed"||c.state==="Cancelled"||!m.active?"disabled":""}>${open?"Withdraw my savings":c.state==="Active"?"Exit early (penalty "+c.penalty/100+"%)":"Leave circle"}</button></div>${due.length===0&&act?'<p class="mut">You are fully up to date.</p>':""}`}</div>`;
- const cal=`<div class="card"><h3>Contribution calendar</h3><div class="scroll"><table><tr><th>Member</th>${Array.from({length:c.rounds},(_,r)=>`<th>R${r+1}<div class="mut">${c.state==="Active"?fd(dl(c,r)):""}</div></th>`).join("")}<th>Late</th></tr>${c.members.map(a=>`<tr ${a===S.me?'style="background:var(--soft)"':""}><td>${av(a)} &nbsp; ${sh(a)}</td>${Array.from({length:c.rounds},(_,r)=>{const s=cellState(c,a,r);return`<td><span class="cell ${s}">${{ok:"✓",due:"!",miss:"✕",fut:"·"}[s]}</span></td>`}).join("")}<td>${c.mem[a].late}</td></tr>`).join("")}</table></div><p class="mut"><span class="cell ok">✓</span> paid &nbsp;<span class="cell due">!</span> due &nbsp;<span class="cell miss">✕</span> overdue &nbsp;<span class="cell fut">·</span> upcoming</p></div>`;
- const tl=`<div class="card"><h3>Goal timeline</h3><ul class="tl"><li class="${c.total>=c.goal?"done":"next"}">Target ${c.goal} ${c.token} — saved ${c.total}</li><li class="${c.state==="Completed"?"done":""}">Term ends ${c.state==="Active"?fd(end):"after "+c.rounds+" rounds"} — withdrawals open at target or term end</li></ul></div>`;
- const rules=`<div class="card"><h3>Rules</h3><ul><li>Round N deadline: start + N × ${fname(c.period).toLowerCase()} period; ${Math.round(c.grace/DAY)} grace day(s) are shown as “due” before a round turns “overdue”.</li><li>One contribution per member per round; future rounds cannot be paid early.</li><li>Late payment: ${c.lateFeeBps/100}% fee shared with the other savers, and a public late mark.</li><li>Withdraw your own balance once the goal is met or the term ends. Exiting earlier: ${c.penalty/100}% penalty shared with those who stay.</li><li>Admin can pause or cancel but cannot withdraw funds; cancellation refunds balances.</li></ul></div>`;
+const card=c=>{const p=progress(c),m=meIn(c),o=m?owed(c,m):0;return`<a class="card" href="#/circle/${c.id}"><div class="row"><b>${esc(c.name)}</b><span class="pill gold">Goal</span></div><div class="mut">${fn(c.amount)} ${esc(c.token)} · ${fname(c.period)} · ${c.members.length}/${c.max} members</div><div class="bar"><i style="width:${p}%"></i></div><div class="row mut"><span>${c.state}${c.paused?" · paused":""}</span><span>${p}% ${c.state==="Open"?"filled":"saved"}</span></div><div class="avs">${c.members.slice(0,7).map(av).join("")}</div>${m&&c.state==="Active"?`<div class="row" style="margin-top:8px">${o?`<span class="pill bad">${o} due</span>`:'<span class="pill">Up to date</span>'}</div>`:""}</a>`};
+const needWallet=what=>`<div class="card"><p>Connect your wallet to see ${what}.</p><button class="btn" id="conn">Connect wallet</button></div>`;
+const tokenOptions=()=>{const ok=S.tokens.filter(t=>t.allowed);return ok.length?ok.map(t=>`<option value="${t.addr}">${esc(t.symbol)}</option>`).join(""):'<option value="">No tokens allowed yet</option>'};
+
+function landing(){return`<div class="hero"><h1>Save together. Reach the goal.</h1><p style="max-width:560px">SaveFi brings cooperative saving on-chain: group goal circles with fixed contributions, or a personal pot that friends and family can add to. Rules are enforced by smart contracts — not promises.</p><a class="btn" href="#/create">Create a circle</a> <a class="btn alt" href="#/newpot">Start a personal pot</a> <a class="btn alt" href="#/discover">Browse</a></div>
+<div class="stats"><div><b>${S.cs.length}</b>circles</div><div><b>${S.pots.length}</b>personal pots</div><div><b>${S.cs.filter(c=>c.state==="Active").length}</b>active circles</div><div><b>BOT Chain</b>Testnet · 968</div></div>
+<h2>Ways to save</h2><div class="grid"><div class="card"><h3>🎯 Goal circle</h3><p class="mut">A group pools toward a shared target on a schedule. Withdraw once the target is met or the term ends; leaving early costs a penalty shared with those who stay.</p></div><div class="card"><h3>🐷 Personal pot</h3><p class="mut">Saving for one goal? Share your link and others add to your pot. You withdraw when the target or date is reached.</p></div><div class="card"><h3>🛡 Honest by design</h3><p class="mut">Nothing runs by itself — every withdrawal is a transaction you send. Admins can never touch member funds.</p></div></div>
+<p class="mut">Factory contract: <a href="${CFG.explorer}/address/${CFG.factory}" target="_blank" rel="noopener"><u>${sh(CFG.factory)}</u></a></p>`}
+
+function discover(q={}){const t=(q.s||"").toLowerCase(),list=S.cs.filter(c=>(!q.t||c.token===q.t)&&c.name.toLowerCase().includes(t)),pots=S.pots.filter(c=>(!q.t||c.token===q.t)&&c.name.toLowerCase().includes(t));
+ return`<h1>Discover</h1><div class="f2"><div><input id="fs" placeholder="Search by name" value="${esc(q.s||"")}"></div><div><select id="ft"><option value="">All currencies</option>${[...new Set(S.tokens.map(x=>x.symbol))].map(s=>`<option ${q.t===s?"selected":""}>${esc(s)}</option>`).join("")}</select></div></div><h2>Goal circles</h2><div class="grid">${list.map(card).join("")||'<p class="mut">No circles match.</p>'}</div><h2>Personal savings pots</h2><div class="grid">${pots.map(potCard).join("")||'<p class="mut">No pots match.</p>'}</div>`}
+
+function create(){return`<h1>Create a savings circle</h1><p><a href="#/newpot"><u>Saving for yourself? Create a personal pot others can add to →</u></a></p><form id="cf" class="card"><div class="f2"><div><label>Circle name</label><input name="name" required maxlength="64" value="Neighbours Savings"></div><div><label>Currency</label><select name="token">${tokenOptions()}</select></div>
+<div><label>Contribution per member per round</label><input name="amount" type="number" min="0" step="any" value="50" required></div><div><label>Frequency</label><select name="freq">${Object.keys(FREQ).map(k=>`<option ${k==="Weekly"?"selected":""}>${k}</option>`).join("")}</select></div>
+<div><label>Number of members (2–50)</label><input name="max" type="number" min="2" max="50" value="5" required></div><div><label>Duration in rounds (1–520)</label><input name="rounds" type="number" min="1" max="520" value="8" required></div>
+<div><label>Shared goal target</label><input name="goal" type="number" min="0" step="any" value="1500" required></div><div><label>Late fee (%, max 20)</label><input name="late" type="number" min="0" max="20" step="0.5" value="5"></div>
+<div><label>Early-exit penalty (%, max 50)</label><input name="pen" type="number" min="0" max="50" value="10"></div></div>
+<label><input type="checkbox" name="inv" style="width:auto"> Invite only</label><div id="prev" class="mut" style="margin:12px 0"></div><button class="btn">Create circle</button> <span class="mut">Sends a transaction to the SaveFi factory on BOT Chain Testnet.</span></form>`}
+
+async function join(id){const c=await fetchCircle(id);const link=location.origin+location.pathname+"#/join/"+id,m=meIn(c);
+ const invitedOk=!c.inviteOnly||(S.me&&(same(S.me,c.admin)||await circleC(id).invited(S.me)));
+ return`<h1>Join “${esc(c.name)}”</h1><div class="card"><div class="stats"><div><b>${fn(c.amount)} ${esc(c.token)}</b>per ${fname(c.period).toLowerCase()} round</div><div><b>${c.members.length}/${c.max}</b>members</div><div><b>${fn(c.goal)} ${esc(c.token)}</b>shared goal</div><div><b>${c.lateFeeBps/100}%</b>late fee</div></div>
+<p>Contributions go to a shared vault. You can withdraw your savings once the goal is reached or the term ends (${c.rounds} rounds); leaving earlier forfeits ${c.penalty/100}%, shared with the members who stay. A payment after its deadline pays the late fee. The schedule starts when the circle is full.</p>
+${!S.me?'<button class="btn" id="conn">Connect wallet to join</button>':m?'<p class="pill">You are already a member</p>':`<p class="mut">Joining wallet: <b>${sh(S.me)}</b></p>${c.inviteOnly&&!invitedOk?'<p class="pill bad">Invite only — ask the admin to invite your wallet</p><br>':""}<button class="btn" data-a="join" data-id="${id}" ${c.state!=="Open"||c.paused||!invitedOk?"disabled":""}>Join with my wallet</button>`}<h3 style="margin-top:16px">Invite link</h3><div class="copy">${link}</div></div>`}
+
+async function circle(id){const c=await fetchCircle(id,true);const me=meIn(c),m=me?c.mem[me]:null,cr=cur(c),p=progress(c),live=c.state==="Active"&&!c.paused,end=c.start+c.rounds*c.period;
+ const due=m&&m.active&&live&&now()<end?Array.from({length:cr+1},(_,r)=>r).filter(r=>!m.paid[r]):[];
+ const stats=`<div class="card"><div class="row"><h1>${esc(c.name)}</h1><span><span class="pill gold">Goal circle</span> <span class="pill ${c.paused||c.state==="Cancelled"?"bad":""}">${c.state}${c.paused?" · paused":""}</span></span></div><div class="mut">Admin ${sh(c.admin)} · ${esc(c.token)} · <a href="${CFG.explorer}/address/${c.id}" target="_blank" rel="noopener"><u>contract</u></a></div><div class="bar"><i style="width:${p}%"></i></div><div class="stats"><div><b>${c.state==="Open"?c.members.length+"/"+c.max:fn(c.total)+" / "+fn(c.goal)}</b>${c.state==="Open"?"members joined":esc(c.token)+" saved"}</div><div><b>${c.unlocked?"Unlocked":"Locked"}</b>${c.unlocked?"withdrawals open":"until goal or "+(c.state==="Active"?fd(end):"term end")}</div><div><b>${c.state==="Active"?"Round "+(cr+1)+"/"+c.rounds:c.state}</b>${c.state==="Active"?"due "+fd(dl(c,cr)):"schedule starts when full"}</div><div><b>${m?fn(m.bal):"—"}</b>your balance</div></div><div class="avs">${c.members.map(av).join("")}</div></div>`;
+ let actHtml;
+ if(!S.me)actHtml=`<button class="btn" id="conn">Connect wallet</button>`;
+ else if(!m)actHtml=c.state==="Open"?`<a class="btn" href="#/join/${id}">Join this circle</a>`:'<p class="mut">You are not a member of this circle.</p>';
+ else{
+   const btns=due.map(r=>`<button class="btn" data-a="contribute" data-id="${id}" data-r="${r}">Contribute round ${r+1}${now()>dl(c,r)?" (late fee)":""}</button>`);
+   if(c.state==="Open")btns.push(`<button class="btn alt" data-a="leave" data-id="${id}">Leave circle</button>`);
+   if(c.state==="Active"&&m.active&&m.bal>0)btns.push(c.unlocked?`<button class="btn alt" data-a="withdraw" data-id="${id}" ${c.paused?"disabled":""}>Withdraw my savings</button>`:`<button class="btn bad" data-a="leave" data-id="${id}" ${c.paused?"disabled":""}>Exit early (penalty ${c.penalty/100}%)</button>`);
+   if(c.state==="Cancelled"&&m.active&&!m.refunded)btns.push(`<button class="btn" data-a="refund" data-id="${id}">Refund my balance</button>`);
+   actHtml=`<div class="row" style="justify-content:flex-start">${btns.join("")}</div>${!m.active?'<p class="mut">You have exited this circle.</p>':""}${m.refunded?'<p class="mut">You have been refunded.</p>':""}${due.length===0&&live&&m.active?'<p class="mut">You are fully up to date.</p>':""}${c.paused?'<p class="mut">The circle is paused — contributions and withdrawals are blocked.</p>':""}`;
+ }
+ const acts=`<div class="card"><h3>Your actions</h3>${actHtml}</div>`;
+ const cal=c.start?`<div class="card"><h3>Contribution calendar</h3><div class="scroll"><table><tr><th>Member</th>${Array.from({length:c.rounds},(_,r)=>`<th>R${r+1}<div class="mut">${fd(dl(c,r))}</div></th>`).join("")}<th>Late</th></tr>${c.members.map(a=>`<tr ${same(a,S.me)?'style="background:var(--soft)"':""}><td>${av(a)} &nbsp; ${sh(a)}${c.mem[a]&&!c.mem[a].active?" (exited)":""}</td>${Array.from({length:c.rounds},(_,r)=>{const s=cellState(c,a,r);return`<td><span class="cell ${s}">${{ok:"✓",due:"!",miss:"✕",fut:"·"}[s]}</span></td>`}).join("")}<td>${c.mem[a]?.late??0}</td></tr>`).join("")}</table></div><p class="mut"><span class="cell ok">✓</span> paid &nbsp;<span class="cell due">!</span> due &nbsp;<span class="cell miss">✕</span> past deadline (late fee applies) &nbsp;<span class="cell fut">·</span> upcoming</p></div>`:"";
+ const tl=`<div class="card"><h3>Goal timeline</h3><ul class="tl"><li class="${c.total>=c.goal?"done":"next"}">Target ${fn(c.goal)} ${esc(c.token)} — saved ${fn(c.total)}</li><li class="${c.state==="Completed"?"done":""}">Term ends ${c.state==="Active"?fd(end):"after "+c.rounds+" rounds"} — withdrawals open at target or term end</li></ul></div>`;
+ const rules=`<div class="card"><h3>Rules</h3><ul><li>Round N deadline: start + N × ${fname(c.period).toLowerCase()} period.</li><li>One contribution per member per round; future rounds cannot be paid early. No payments are accepted after the term ends.</li><li>Late payment (after the deadline): ${c.lateFeeBps/100}% fee shared with the other savers, and a public late mark.</li><li>Withdraw your own balance once the goal is met or the term ends. Exiting earlier: ${c.penalty/100}% penalty shared with those who stay.</li><li>Admin can pause, or cancel while paused, but cannot withdraw funds; cancellation lets members refund their balances.</li></ul></div>`;
  return stats+acts+cal+tl+rules}
-function dashboard(){const ms=mine(),ps=D.pots.filter(c=>c.owner===S.me);return`<h1>My dashboard</h1><div class="card"><div class="stats"><div><b>${ms.length}</b>circles</div><div><b>${ms.reduce((s,c)=>s+owed(c,S.me),0)}</b>outstanding contributions</div><div><b>${ms.reduce((s,c)=>s+c.mem[S.me].bal,0)}</b>saved in circles</div><div><b>${ps.reduce((s,c)=>s+c.total-c.withdrawn,0)}</b>in my pots</div></div></div><div class="grid">${ms.map(c=>{const o=owed(c,S.me);return card(c).replace("</a>",`<div class="row" style="margin-top:8px">${o?`<span class="pill bad">${o} due</span>`:'<span class="pill">Up to date</span>'}</div></a>`)}).join("")}${ps.map(potCard).join("")}</div>${ms.length+ps.length?"":'<p class="mut">Nothing yet. <a href="#/discover"><u>Discover circles</u></a> or <a href="#/newpot"><u>start a pot</u></a>.</p>'}`}
-function history(){const rows=[];mine().forEach(c=>c.members.filter(a=>a===S.me).forEach(a=>{for(let r=0;r<c.rounds;r++){const s=cellState(c,a,r);if(s!=="fut")rows.push(`<tr><td><a href="#/circle/${c.id}"><u>${esc(c.name)}</u></a></td><td>Round ${r+1}</td><td>${fd(dl(c,r))}</td><td>${c.amount} ${c.token}</td><td><span class="cell ${s}">${{ok:"✓",due:"!",miss:"✕"}[s]}</span> ${{ok:"Paid",due:"Due",miss:"Overdue"}[s]}</td></tr>`)}}));
+
+async function dashboard(){if(!S.me)return needWallet("your dashboard");const ms=mine();await Promise.all(ms.filter(c=>c.state==="Active").map(c=>loadPaid(c,[meIn(c)])));const ps=S.pots.filter(c=>same(c.owner,S.me));
+ return`<h1>My dashboard</h1><div class="card"><div class="stats"><div><b>${ms.length}</b>circles</div><div><b>${ms.reduce((s,c)=>s+owed(c,meIn(c)),0)}</b>outstanding contributions</div><div><b>${ps.length}</b>my pots</div></div><p class="mut">Balances are in each circle's own currency — open a circle to see yours.</p></div><div class="grid">${ms.map(card).join("")}${ps.map(potCard).join("")}</div>${ms.length+ps.length?"":'<p class="mut">Nothing yet. <a href="#/discover"><u>Discover circles</u></a> or <a href="#/newpot"><u>start a pot</u></a>.</p>'}`}
+
+async function history(){if(!S.me)return needWallet("your contributions");const ms=mine();await Promise.all(ms.map(c=>loadPaid(c,[meIn(c)])));const rows=[];
+ ms.forEach(c=>{const a=meIn(c);for(let r=0;r<=lastRound(c);r++){const paid=c.mem[a]?.paid[r];const s=paid?"ok":cellState(c,a,r);if(s!=="fut")rows.push(`<tr><td><a href="#/circle/${c.id}"><u>${esc(c.name)}</u></a></td><td>Round ${r+1}</td><td>${fd(dl(c,r))}</td><td>${fn(c.amount)} ${esc(c.token)}</td><td><span class="cell ${s}">${{ok:"✓",due:"!",miss:"✕"}[s]}</span> ${{ok:"Paid",due:"Due",miss:"Unpaid (past deadline)"}[s]}</td></tr>`)}});
  return`<h1>Contribution history</h1><div class="card scroll"><table><tr><th>Circle</th><th>Round</th><th>Deadline</th><th>Amount</th><th>Status</th></tr>${rows.join("")||'<tr><td colspan="5" class="mut">No contributions yet.</td></tr>'}</table></div>`}
 
-function admin(){const mc=S.cs.filter(c=>c.admin===S.me);
- return`<h1>Admin dashboard</h1><h2>Circles you administer</h2>${mc.map(c=>`<div class="card"><div class="row"><b>${esc(c.name)}</b><span class="pill ${c.paused?"bad":""}">${c.state}${c.paused?" · paused":""}</span></div><div class="row" style="justify-content:flex-start;margin-top:8px"><button class="btn alt" data-a="pause" data-id="${c.id}">${c.paused?"Resume":"Emergency pause"}</button><button class="btn bad" data-a="cancel" data-id="${c.id}" ${c.state==="Open"||c.paused&&c.state==="Active"?"":"disabled"}>Cancel &amp; enable refunds</button><input style="max-width:280px" placeholder="Invite wallet 0x…" data-inv="${c.id}"><button class="btn alt" data-a="invite" data-id="${c.id}">Invite</button></div><p class="mut">Cancelling an active circle requires pausing first. Admin never has access to member funds.</p></div>`).join("")||'<p class="mut">You do not administer any circle with this wallet.</p>'}
-<h2>Settings</h2><form id="sf" class="card"><div class="f2"><div><label>Factory address</label><input name="factory" value="${esc(S.cfg.factory)}" placeholder="0x…"></div><div><label>USDT token address</label><input name="usdt" value="${esc(S.cfg.usdt)}" placeholder="0x…"></div><div><label>BOT token address (blank = native coin)</label><input name="bot" value="${esc(S.cfg.bot)}"></div></div><br><button class="btn">Save &amp; use live wallet</button> <button type="button" class="btn alt" id="demo">Back to demo</button></form>
-${S.live?"":`<div class="card"><h3>Demo clock</h3><p class="mut">Simulate the passage of time to test deadlines, late fees and misses.</p><button class="btn alt" data-adv="1">+1 day</button> <button class="btn alt" data-adv="7">+7 days</button></div>`}`}
-function potCard(c){const p=Math.min(100,Math.round(100*c.total/c.target));return`<a class="card" href="#/pot/${c.id}"><div class="row"><b>${esc(c.name)}</b><span class="pill gold">Pot</span></div><div class="mut">for ${sh(c.owner)} · target ${c.target} ${c.token}</div><div class="bar"><i style="width:${p}%"></i></div><div class="row mut"><span>${c.state}</span><span>${p}% saved</span></div><div class="avs">${Object.keys(c.contribs).slice(0,7).map(av).join("")}</div></a>`}
-function newPot(){return`<h1>Create a personal savings pot</h1><form id="pf" class="card"><div class="f2"><div><label>What are you saving for?</label><input name="name" required maxlength="64" value="My savings goal"></div><div><label>Currency</label><select name="token"><option>USDT</option><option>BOT</option></select></div><div><label>Target</label><input name="target" type="number" min="1" step="any" value="500"></div><div><label>Unlock date (days from now)</label><input name="days" type="number" min="1" value="30"></div><div><label>Minimum contribution</label><input name="min" type="number" min="0" step="any" value="5"></div></div><p class="mut">Anyone with the link can add to your pot. You can withdraw once the target is reached or the unlock date passes. Before that you can cancel, and every contributor (you included) refunds their own contribution.</p><button class="btn">Create pot</button></form>`}
-function pot(id){const c=D.pf(id);if(!c)return"<p>Pot not found.</p>";const own=S.me===c.owner,p=Math.min(100,Math.round(100*c.total/c.target)),open=c.total>=c.target||now()>=c.unlock,link=location.origin+location.pathname+"#/pot/"+id,mine=c.contribs[S.me]||0,left=c.total-c.withdrawn,cs=Object.entries(c.contribs).sort((a,b)=>b[1]-a[1]);
- return`<div class="card"><div class="row"><h1>${esc(c.name)}</h1><span><span class="pill gold">Pot</span> <span class="pill ${c.state==="Cancelled"?"bad":""}">${c.state}</span></span></div><div class="mut">Savings of ${av(c.owner)} &nbsp;${sh(c.owner)}${own?" (you)":""}</div><div class="bar"><i style="width:${p}%"></i></div><div class="stats"><div><b>${c.total} ${c.token}</b>raised of ${c.target}</div><div><b>${open?"Unlocked":"Locked"}</b>${open?"owner can withdraw":"until target or "+fd(c.unlock)}</div><div><b>${left}</b>available to withdraw</div><div><b>${cs.length}</b>contributors</div></div></div>
-<div class="card"><h3>Add to this pot</h3>${c.state==="Active"?`<div class="row" style="justify-content:flex-start"><input id="pamt" type="number" min="${c.min}" step="any" value="${Math.max(c.min,10)}" style="max-width:160px"><button class="btn" data-a="potContribute" data-id="${id}">Contribute ${c.token}</button></div><p class="mut">Contributing as ${sh(S.me)}. Contributions can only be taken back if the owner cancels before unlock.</p>`:'<p class="mut">This pot is closed.</p>'}${c.state==="Cancelled"&&mine>0?`<button class="btn alt" data-a="potRefund" data-id="${id}">Refund my ${mine} ${c.token}</button>`:""}<h3 style="margin-top:14px">Share link</h3><div class="copy">${link}</div></div>
-${own?`<div class="card"><h3>Owner actions</h3><div class="row" style="justify-content:flex-start"><button class="btn" data-a="potWithdraw" data-id="${id}" ${open&&c.state==="Active"&&left>0?"":"disabled"}>Withdraw ${left} ${c.token}</button><button class="btn bad" data-a="potCancel" data-id="${id}" ${!open&&c.state==="Active"&&c.withdrawn===0?"":"disabled"}>Cancel &amp; refund contributors</button></div><p class="mut">Withdrawal is a transaction you send yourself; nothing is paid out automatically.</p></div>`:""}
-<div class="card"><h3>Contributors</h3>${cs.map(([a,n])=>`<div class="row" style="padding:5px 0">${av(a)}<span style="flex:1;margin-left:14px">${sh(a)}${a===S.me?" (you)":""}</span><b>${n} ${c.token}</b></div>`).join("")||'<p class="mut">No contributions yet.</p>'}</div>`}
+function admin(){if(!S.me)return needWallet("admin controls");const mc=S.cs.filter(c=>same(c.admin,S.me)),isOwner=same(S.factoryOwner,S.me);
+ return`<h1>Admin dashboard</h1><h2>Circles you administer</h2>${mc.map(c=>`<div class="card"><div class="row"><a href="#/circle/${c.id}"><b><u>${esc(c.name)}</u></b></a><span class="pill ${c.paused?"bad":""}">${c.state}${c.paused?" · paused":""}</span></div><div class="row" style="justify-content:flex-start;margin-top:8px"><button class="btn alt" data-a="pause" data-id="${c.id}" ${c.state==="Completed"||c.state==="Cancelled"?"disabled":""}>${c.paused?"Resume":"Emergency pause"}</button><button class="btn bad" data-a="cancel" data-id="${c.id}" ${c.state==="Open"||(c.paused&&c.state==="Active")?"":"disabled"}>Cancel &amp; enable refunds</button>${c.inviteOnly&&c.state==="Open"?`<input style="max-width:280px" placeholder="Invite wallet 0x…" data-inv="${c.id}"><button class="btn alt" data-a="invite" data-id="${c.id}">Invite</button>`:""}</div><p class="mut">Cancelling an active circle requires pausing first. Admin never has access to member funds.</p></div>`).join("")||'<p class="mut">You do not administer any circle with this wallet.</p>'}
+<h2>Platform</h2><div class="card"><p class="mut">Factory: <a href="${CFG.explorer}/address/${CFG.factory}" target="_blank" rel="noopener"><u>${CFG.factory}</u></a><br>Factory owner: ${sh(S.factoryOwner)}${isOwner?" (you)":""}</p>
+<h3>Allowed currencies</h3>${S.tokens.map(t=>`<div class="row" style="padding:4px 0"><span>${esc(t.symbol)} <span class="mut">${t.addr===ZERO?"native coin":sh(t.addr)}</span></span><span>${t.allowed?'<span class="pill">Allowed</span>':isOwner?`<button class="btn alt" data-a="allowToken" data-arg="${t.addr}">Allow</button>`:'<span class="pill bad">Not allowed</span>'}</span></div>`).join("")}</div>`}
+
+function potCard(c){const p=Math.min(100,Math.round(100*c.total/(c.target||1)));return`<a class="card" href="#/pot/${c.id}"><div class="row"><b>${esc(c.name)}</b><span class="pill gold">Pot</span></div><div class="mut">for ${sh(c.owner)} · target ${fn(c.target)} ${esc(c.token)}</div><div class="bar"><i style="width:${p}%"></i></div><div class="row mut"><span>${c.state}${c.paused?" · paused":""}</span><span>${p}% saved</span></div><div class="avs">${c.contributors.slice(0,7).map(av).join("")}</div></a>`}
+function newPot(){return`<h1>Create a personal savings pot</h1><form id="pf" class="card"><div class="f2"><div><label>What are you saving for?</label><input name="name" required maxlength="64" value="My savings goal"></div><div><label>Currency</label><select name="token">${tokenOptions()}</select></div><div><label>Target</label><input name="target" type="number" min="0" step="any" value="500" required></div><div><label>Unlock date (days from now)</label><input name="days" type="number" min="1" value="30" required></div><div><label>Minimum contribution</label><input name="min" type="number" min="0" step="any" value="5"></div></div><p class="mut">Anyone with the link can add to your pot. You can withdraw once the target is reached or the unlock date passes. Before that you can cancel, and every contributor (you included) refunds their own contribution.</p><button class="btn">Create pot</button></form>`}
+
+async function pot(id){const c=await fetchPot(id,true);const own=same(S.me,c.owner),p=Math.min(100,Math.round(100*c.total/(c.target||1))),link=location.origin+location.pathname+"#/pot/"+id,myKey=S.me&&c.contributors.find(a=>same(a,S.me)),mineAmt=myKey?c.contribs[myKey]:0,left=c.total-c.withdrawn,cs=Object.entries(c.contribs).sort((a,b)=>b[1]-a[1]);
+ return`<div class="card"><div class="row"><h1>${esc(c.name)}</h1><span><span class="pill gold">Pot</span> <span class="pill ${c.state==="Cancelled"||c.paused?"bad":""}">${c.state}${c.paused?" · paused":""}</span></span></div><div class="mut">Savings of ${av(c.owner)} &nbsp;${sh(c.owner)}${own?" (you)":""} · <a href="${CFG.explorer}/address/${c.id}" target="_blank" rel="noopener"><u>contract</u></a></div><div class="bar"><i style="width:${p}%"></i></div><div class="stats"><div><b>${fn(c.total)} ${esc(c.token)}</b>raised of ${fn(c.target)}</div><div><b>${c.unlocked?"Unlocked":"Locked"}</b>${c.unlocked?"owner can withdraw":"until target or "+fd(c.unlock)}</div><div><b>${fn(left)}</b>available to withdraw</div><div><b>${cs.length}</b>contributors</div></div></div>
+<div class="card"><h3>Add to this pot</h3>${c.state==="Active"&&!c.paused?`<div class="row" style="justify-content:flex-start"><input id="pamt" type="number" min="${c.min}" step="any" value="${Math.max(c.min,10)}" style="max-width:160px"><button class="btn" data-a="potContribute" data-id="${id}">Contribute ${esc(c.token)}</button></div><p class="mut">${S.me?"Contributing as "+sh(S.me)+". ":""}Minimum ${fn(c.min)} ${esc(c.token)}. Contributions can only be taken back if the owner cancels before unlock.</p>`:'<p class="mut">This pot is not accepting contributions.</p>'}${c.state==="Cancelled"&&mineAmt>0?`<button class="btn alt" data-a="potRefund" data-id="${id}">Refund my ${fn(mineAmt)} ${esc(c.token)}</button>`:""}<h3 style="margin-top:14px">Share link</h3><div class="copy">${link}</div></div>
+${own?`<div class="card"><h3>Owner actions</h3><div class="row" style="justify-content:flex-start"><button class="btn" data-a="potWithdraw" data-id="${id}" ${c.unlocked&&c.state==="Active"&&!c.paused&&left>0?"":"disabled"}>Withdraw ${fn(left)} ${esc(c.token)}</button><button class="btn bad" data-a="potCancel" data-id="${id}" ${!c.unlocked&&c.state==="Active"&&c.withdrawn===0?"":"disabled"}>Cancel &amp; refund contributors</button></div><p class="mut">Withdrawal is a transaction you send yourself; nothing is paid out automatically.</p></div>`:""}
+<div class="card"><h3>Contributors</h3>${cs.map(([a,n])=>`<div class="row" style="padding:5px 0">${av(a)}<span style="flex:1;margin-left:14px">${sh(a)}${same(a,S.me)?" (you)":""}</span><b>${fn(n)} ${esc(c.token)}</b></div>`).join("")||'<p class="mut">No contributions yet.</p>'}</div>`}
+
 /* ───────── Router ───────── */
 const NAV=[["","Home"],["discover","Discover"],["create","Create"],["dashboard","Dashboard"],["contributions","Contributions"],["admin","Admin"]];
-function header(){const r=(location.hash.slice(2)||"").split("/")[0];$("#nav").innerHTML=NAV.map(([h,t])=>`<a href="#/${h}" class="${r===h?"on":""}">${t}</a>`).join("");
- $("#wallet").innerHTML=S.live?`${av(S.me)}<span class="mut">${sh(S.me)}</span>`:`<span class="pill gold">Demo</span><select id="who" title="Switch demo wallet">${S.ids.map((a,i)=>`<option value="${a}" ${a===S.me?"selected":""}>Wallet ${i+1} · ${sh(a)}</option>`).join("")}</select><button class="btn alt" id="conn">Connect wallet</button>`}
-async function render(){header();const[r,id]=(location.hash.slice(2)||"").split("/"),q=Object.fromEntries(new URLSearchParams((location.hash.split("?")[1]||"")));let h;
- try{h=({"":landing,discover:()=>discover(q),create,newpot:newPot,pot:()=>pot(id),join:()=>join(id),circle:()=>circle(id),dashboard,contributions:history,admin}[r]||landing)()}catch(e){h=`<p>Something went wrong: ${esc(e.message)}</p>`}$("#app").innerHTML=h;
- const f=$("#cf");if(f){const pv=()=>{const d=new FormData(f),n=+d.get("max"),a=+d.get("amount"),rd=+d.get("rounds");$("#prev").textContent=`Each member pays ${a} ${d.get("token")} × ${rd} rounds (${rd*FREQ[d.get("freq")]/DAY} days). If everyone pays on time the vault holds ${a*n*rd} vs a target of ${d.get("goal")}.`};f.oninput=pv;pv()}}
-document.addEventListener("click",e=>{const b=e.target.closest("[data-a]");if(b){const a=b.dataset.a;let arg=b.dataset.r!==undefined?+b.dataset.r:undefined;if(a==="invite")arg=$(`[data-inv="${b.dataset.id}"]`).value.trim();if(a==="potContribute")arg=+$("#pamt").value;act(a,b.dataset.id,arg);return}
- if(e.target.dataset.adv){S.clock+=+e.target.dataset.adv*DAY;toast("Clock advanced");render();return}
- if(e.target.id==="conn"){liveConnect().then(async()=>{S.cs=await load();toast("Connected "+sh(S.me));render()}).catch(x=>toast(x.message))}
- if(e.target.id==="demo"){S.live=false;S.me=S.ids[1];S.cs=D.cs;render()}});
-document.addEventListener("change",e=>{if(e.target.id==="who"){S.me=e.target.value;render()}if(["fs","ft"].includes(e.target.id)){location.hash=`#/discover?s=${encodeURIComponent($("#fs").value)}&t=${$("#ft").value}`}});
+const route=()=>{const [path,qs]=(location.hash.slice(2)||"").split("?");const [r,id]=path.split("/");return{r,id,q:Object.fromEntries(new URLSearchParams(qs||""))}};
+function header(){const{r}=route();$("#nav").innerHTML=NAV.map(([h,t])=>`<a href="#/${h}" class="${r===h?"on":""}">${t}</a>`).join("");
+ $("#wallet").innerHTML=S.me?`${av(S.me)}<span class="mut">${sh(S.me)}</span>`:`<span class="pill">Testnet</span><button class="btn alt" id="conn">Connect wallet</button>`}
+let renderSeq=0;
+async function render(){header();const{r,id,q}=route(),seq=++renderSeq;$("#app").innerHTML='<div class="card mut">Loading from BOT Chain…</div>';let h;
+ try{h=await(({"":landing,discover:()=>discover(q),create,newpot:newPot,pot:()=>pot(id),join:()=>join(id),circle:()=>circle(id),dashboard,contributions:history,admin}[r]||landing)())}catch(e){console.error(e);h=`<div class="card"><p>Could not load this page: ${esc(errMsg(e))}</p></div>`}
+ if(seq!==renderSeq)return;$("#app").innerHTML=h;
+ const f=$("#cf");if(f){const pv=()=>{const d=new FormData(f),n=+d.get("max"),a=+d.get("amount"),rd=+d.get("rounds"),sym=S.tokens.find(t=>t.addr===d.get("token"))?.symbol||"";$("#prev").textContent=`Each member pays ${a} ${sym} × ${rd} rounds (${rd*FREQ[d.get("freq")]/DAY} days). If everyone pays on time the vault holds ${fn(a*n*rd)} vs a target of ${d.get("goal")}.`};f.oninput=pv;pv()}}
+
+/* ───────── Events ───────── */
+document.addEventListener("click",e=>{const b=e.target.closest("[data-a]");if(b){const a=b.dataset.a;let arg=b.dataset.r!==undefined?+b.dataset.r:b.dataset.arg;if(a==="invite")arg=$(`[data-inv="${b.dataset.id}"]`).value.trim();if(a==="potContribute")arg=$("#pamt").value;act(a,b.dataset.id,arg);return}
+ if(e.target.id==="conn"){connect().then(()=>{toast("Connected "+sh(S.me));render()}).catch(x=>toast(errMsg(x)))}});
+document.addEventListener("change",e=>{if(["fs","ft"].includes(e.target.id)){location.hash=`#/discover?s=${encodeURIComponent($("#fs").value)}&t=${encodeURIComponent($("#ft").value)}`}});
 document.addEventListener("submit",async e=>{e.preventDefault();const d=new FormData(e.target);
- if(e.target.id==="pf")act("createPot",null,{name:d.get("name"),token:d.get("token"),target:+d.get("target"),unlock:now()+(+d.get("days"))*DAY,min:+d.get("min")});
- if(e.target.id==="cf"){const n=+d.get("max");act("create",null,{name:d.get("name"),mode:"Goal",token:d.get("token"),amount:+d.get("amount"),period:FREQ[d.get("freq")],grace:+d.get("grace")*DAY,rounds:+d.get("rounds"),lateFeeBps:Math.round(+d.get("late")*100),penalty:Math.round(+d.get("pen")*100),depositRounds:0,max:n,goal:+d.get("goal"),inviteOnly:!!d.get("inv")})}
- if(e.target.id==="sf"){S.cfg={factory:d.get("factory").trim(),usdt:d.get("usdt").trim(),bot:d.get("bot").trim()};try{await liveConnect();S.cs=await load();toast("Live mode on");render()}catch(x){toast(x.message)}}});
+ try{
+  if(e.target.id==="pf"){const tok=S.tokens.find(t=>t.addr===d.get("token"));if(!tok)throw new Error("Select an allowed currency");
+   const days=+d.get("days");if(!(days>=1))throw new Error("Unlock must be at least 1 day away");
+   const target=ethers.utils.parseUnits(String(d.get("target")||"0"),tok.decimals);if(target.isZero())throw new Error("Target must be greater than 0");
+   act("createPot",null,{name:d.get("name").trim(),token:tok.addr,target,unlock:now()+days*DAY,min:ethers.utils.parseUnits(String(d.get("min")||"0"),tok.decimals)})}
+  if(e.target.id==="cf"){const tok=S.tokens.find(t=>t.addr===d.get("token"));if(!tok)throw new Error("Select an allowed currency");
+   const max=+d.get("max"),rounds=+d.get("rounds"),late=+d.get("late"),pen=+d.get("pen");
+   if(!(Number.isInteger(max)&&max>=2&&max<=50))throw new Error("Members must be 2–50");
+   if(!(Number.isInteger(rounds)&&rounds>=1&&rounds<=520))throw new Error("Rounds must be 1–520");
+   if(!(late>=0&&late<=20))throw new Error("Late fee must be 0–20%");if(!(pen>=0&&pen<=50))throw new Error("Penalty must be 0–50%");
+   const amount=ethers.utils.parseUnits(String(d.get("amount")||"0"),tok.decimals),goal=ethers.utils.parseUnits(String(d.get("goal")||"0"),tok.decimals);
+   if(amount.isZero()||goal.isZero())throw new Error("Contribution and goal must be greater than 0");
+   act("create",null,{name:d.get("name").trim(),token:tok.addr,amount,period:FREQ[d.get("freq")],grace:0,rounds,lateFeeBps:Math.round(late*100),earlyExitPenaltyBps:Math.round(pen*100),maxMembers:max,inviteOnly:!!d.get("inv"),goalTarget:goal})}
+ }catch(x){toast(errMsg(x))}});
 window.addEventListener("hashchange",render);
-seed();S.cs=D.cs;render();
+if(window.ethereum?.on){window.ethereum.on("accountsChanged",()=>location.reload());window.ethereum.on("chainChanged",()=>location.reload())}
+
+/* ───────── Init ───────── */
+(async()=>{
+ $("#app").innerHTML='<div class="card mut">Loading from BOT Chain…</div>';
+ try{await Promise.all([loadTokens(),loadAll()])}catch(e){console.error(e);toast("Could not reach BOT Chain: "+errMsg(e))}
+ // silently reconnect if already authorised and on the right chain
+ if(window.ethereum){try{const acc=await window.ethereum.request({method:"eth_accounts"}),ch=await window.ethereum.request({method:"eth_chainId"});if(acc.length&&parseInt(ch,16)===CFG.chainId)await connect()}catch{}}
+ render();
+})();
 </script></body></html>
